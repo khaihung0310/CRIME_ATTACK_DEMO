@@ -7,7 +7,7 @@ A safe local simulation of the **CRIME (Compression Ratio Info-leak Made Easy)**
 - curl
 - DEFLATE (`zlib`) compression
 
-This project does **not** reproduce the original TLS-level CRIME exploit. Instead, it demonstrates the same **compression oracle principle** behind the vulnerability in a modern and safe local environment.
+This project does **not** reproduce the original TLS-level CRIME exploit. It demonstrates the same compression oracle principle in a modern, local-only environment.
 
 This demo was prepared for the **COMP2320 Offensive Security** presentation by **Team 244**.
 
@@ -17,28 +17,50 @@ This demo was prepared for the **COMP2320 Offensive Security** presentation by *
 
 The original CRIME attack abused:
 
-- TLS/SPDY compression
+- TLS/SPDY request compression
 - attacker-controlled input
 - encrypted packet length leakage
 
 to recover secret session cookies.
 
-Modern browsers and TLS 1.3 no longer support TLS-level compression, so this demo recreates the same idea locally using Python, HTTP traffic, and DEFLATE compression.
+Modern browsers and TLS stacks no longer support TLS-level compression, so this demo recreates the idea locally with Python, HTTP-like request data, DEFLATE compression, and simulated TLS record overhead.
 
 ---
 
 ## Demo Architecture
 
 ```text
-Attacker input
+Attacker guess
       ↓
-HTTP request + secret cookie
+Internal HTTP request containing guess + hidden cookie
       ↓
 DEFLATE compression using zlib
       ↓
-Compressed size oracle
+Fake TLS record overhead is added
       ↓
-More accurate guess → smaller compressed size
+Observed TLS record length
+      ↓
+Better guess → better compression → smaller observed length
+```
+
+The hidden cookie in the demo is:
+
+```text
+sessionid=9f86d081884c7d659a2f
+```
+
+The simulated TLS length is calculated as:
+
+```text
+observed_tls_record_length = TLS_HEADER + compressed_size + TLS_MAC + TLS_PADDING
+```
+
+where:
+
+```text
+TLS_HEADER = 5
+TLS_MAC = 20
+TLS_PADDING = 16
 ```
 
 ---
@@ -63,7 +85,7 @@ Activate the virtual environment:
 source venv/bin/activate
 ```
 
-Install Flask inside the virtual environment:
+Install Flask:
 
 ```bash
 pip install flask
@@ -98,7 +120,9 @@ Running on http://127.0.0.1:5000
 
 ---
 
-## Testing with curl
+## `/oracle` Attacker View
+
+The `/oracle` endpoint is the attacker-facing view. It does not expose the internal plaintext request, the real compressed data, or the hidden cookie.
 
 Basic format:
 
@@ -106,64 +130,107 @@ Basic format:
 curl "http://127.0.0.1:5000/oracle?guess=<attacker_guess>"
 ```
 
-Example guesses:
+Example:
 
 ```bash
-curl "http://127.0.0.1:5000/oracle?guess=S"
-curl "http://127.0.0.1:5000/oracle?guess=SE"
-curl "http://127.0.0.1:5000/oracle?guess=SEC"
-curl "http://127.0.0.1:5000/oracle?guess=SECR"
-curl "http://127.0.0.1:5000/oracle?guess=SECD"
+curl "http://127.0.0.1:5000/oracle?guess=9f"
 ```
 
----
+Example response:
 
-## Expected Behaviour
+```json
+{
+  "explanation": "Attacker view: only the simulated encrypted TLS record length is visible...",
+  "guess": "9f",
+  "observed_tls_record_length": 150
+}
+```
 
-More accurate guesses usually produce:
+Try comparing guesses:
 
-- better compression
-- smaller compressed size
+```bash
+curl "http://127.0.0.1:5000/oracle?guess=9"
+curl "http://127.0.0.1:5000/oracle?guess=9f"
+curl "http://127.0.0.1:5000/oracle?guess=9f8"
+curl "http://127.0.0.1:5000/oracle?guess=aaaa"
+```
 
-Example pattern:
+The key observation is:
 
 ```text
-Guess: S      → smaller than a random guess
-Guess: SE     → smaller again
-Guess: SEC    → smaller again
-Guess: SECR   → better than SECD if the secret starts with SECR
-Guess: SECD   → partial match, but worse than the correct next character
+Correct prefix → better compression → smaller observed TLS record length
 ```
-
-This demonstrates the compression side-channel used by CRIME: matching input creates repeated strings, repeated strings compress better, and smaller compressed output reveals information about the secret.
 
 ---
 
-## What HTTP Looks Like Internally
+## `/debug` Teaching View
 
-A real request to the local Flask oracle looks like this:
+The `/debug` endpoint is for explaining the demo during a presentation. It reveals the internal HTTP-like request and the raw compressed size so students can see why the oracle works.
 
-```http
-GET /oracle?guess=SE HTTP/1.1
-Host: 127.0.0.1:5000
+Example:
+
+```bash
+curl "http://127.0.0.1:5000/debug?guess=9f8"
 ```
 
-Inside the demo, the server builds a vulnerable-style HTTP request like this:
+The debug response includes:
+
+- `guess`
+- `fake_http_request`
+- `compressed_size`
+- `observed_tls_record_length`
+- `match_length`
+
+Internally, the demo builds a vulnerable-style request like this:
 
 ```http
-GET /search?q=session=SE HTTP/1.1
+GET /search?q=sessionid=9f8 HTTP/1.1
 Host: victim.local
-Cookie: session=SECRET
+Cookie: sessionid=9f86d081884c7d659a2f
+User-Agent: Mozilla/5.0
+Accept: text/html,application/xhtml+xml
+Referer: http://attacker.local/
 ```
 
-Where:
+The attacker-controlled query value and the hidden cookie are compressed together. If the guess repeats the cookie prefix, DEFLATE can encode the repeated text more efficiently.
+
+---
+
+## `/attack` Automated Recovery
+
+The `/attack` endpoint runs a local, simplified, character-by-character recovery simulation.
+
+Example:
+
+```bash
+curl "http://127.0.0.1:5000/attack"
+```
+
+The endpoint uses this restricted alphabet:
 
 ```text
-q=session=SE             attacker-controlled guess
-Cookie: session=SECRET   hidden secret cookie
+0123456789abcdef
 ```
 
-If the guess matches part of the secret cookie, the repeated text compresses more efficiently.
+At each position, it tries one extra character, checks the simulated TLS record length, and keeps the candidate with the smallest length.
+
+The demo also uses a few simple padding probes:
+
+```text
+"", "A", "AA", "AAA", "AAAA", "AAAAA"
+```
+
+These probes reduce ties in the compressed length signal. Real side-channel attacks often need repeated measurements, alignment, and statistical handling; this lab keeps that idea small enough to explain live.
+
+The response includes:
+
+- `alphabet`
+- `padding_probes`
+- `recovered_cookie_prefix`
+- `steps`
+- `explanation`
+
+This is intentionally simple so the class can inspect the JSON and follow how compression length becomes an oracle.
 
 ---
 
@@ -174,7 +241,7 @@ If the guess matches part of the secret cookie, the repeated text compresses mor
 Go to:
 
 ```text
-Proxy → Intercept
+Proxy -> Intercept
 ```
 
 Enable:
@@ -194,13 +261,13 @@ Open browser
 Then visit:
 
 ```text
-http://127.0.0.1:5000/oracle?guess=SE
+http://127.0.0.1:5000/oracle?guess=9f8
 ```
 
 Burp should intercept the request:
 
 ```http
-GET /oracle?guess=SE HTTP/1.1
+GET /oracle?guess=9f8 HTTP/1.1
 Host: 127.0.0.1:5000
 ```
 
@@ -227,7 +294,7 @@ Send to Repeater
 In Repeater, change the guess manually:
 
 ```http
-GET /oracle?guess=SECR HTTP/1.1
+GET /oracle?guess=9f86 HTTP/1.1
 Host: 127.0.0.1:5000
 ```
 
@@ -237,64 +304,54 @@ Click:
 Send
 ```
 
-The response will appear inside Burp Suite:
+Then compare it with a wrong prefix:
 
-```json
-{
-  "guess": "SECR",
-  "compressed_size": 84
-}
+```http
+GET /oracle?guess=aaaa HTTP/1.1
+Host: 127.0.0.1:5000
 ```
 
-Try comparing:
-
-```text
-S
-SE
-SEC
-SECR
-SECD
-SECRET
-```
-
-The key observation is:
-
-```text
-Correct prefix → better compression → smaller compressed size
-```
+The response only shows the simulated observed TLS record length, which is closer to what a network attacker would measure.
 
 ---
 
-## Important Notes
+## Why This Is Not a Full TLS CRIME Exploit
 
 This demo:
 
 - does not break encryption
 - does not decrypt TLS
+- does not enable TLS compression
+- does not attack browsers
 - does not attack real servers
-- does not reproduce the full original TLS-level CRIME exploit
+- does not connect to external services
+- does not reproduce the full original TLS-level CVE-2012-4929 exploit
 
 It safely demonstrates:
 
 - compression side-channels
-- packet length leakage
+- encrypted length leakage
 - attacker-controlled compression oracles
+- why secret cookies and attacker input should not be compressed together
+
+The `observed_tls_record_length` value is simulated locally. It is not captured from a real TLS connection.
 
 ---
 
-## Why a Real CRIME Exploit Is Difficult Today
+## Why Full Reproduction Is Difficult Today
 
-A full real-world CRIME exploit is difficult to reproduce today because modern browsers and servers no longer support TLS compression.
+A real CRIME exploit is difficult to reproduce safely today because modern browsers and servers removed the vulnerable behavior.
 
-After CVE-2012-4929 was disclosed in 2012, major browsers such as Chrome and Firefox disabled TLS compression. TLS 1.3 later removed TLS-level compression entirely.
+After CVE-2012-4929 was disclosed in 2012, major browsers disabled TLS compression. TLS 1.3 later removed TLS-level compression entirely.
 
-Recreating the original CRIME attack would require:
+Recreating the original attack would require:
 
 - outdated browsers
-- legacy OpenSSL/TLS implementations
+- legacy OpenSSL or TLS libraries
 - deprecated server configurations
+- TLS/SPDY compression support
 
-These are no longer practical or secure to deploy for a class presentation.
+Those components are unsafe and impractical for a university presentation. This lab keeps the important security lesson while avoiding obsolete and dangerous infrastructure.
 
 ---
 
@@ -305,7 +362,7 @@ Use this explanation during the demo:
 ```text
 This is a safe local simulation. It does not attack a real server, but it demonstrates the same DEFLATE compression oracle principle used by CRIME.
 
-The attacker controls part of the request through the guess parameter. The hidden cookie is compressed together with the guess. When the guess matches the cookie prefix, compression becomes more efficient and the compressed size becomes smaller.
+The attacker controls part of the request through the guess parameter. The hidden cookie is compressed together with the guess. When the guess matches the cookie prefix, compression becomes more efficient and the simulated TLS record length becomes smaller.
 
 This shows how CRIME turned encrypted packet length into a side-channel oracle.
 ```
@@ -318,7 +375,4 @@ This project is intended for:
 
 - cybersecurity education
 - university presentations
-- side-channel attack demonstrations
-- protocol security research
-
-Only use this project in safe and authorised environments.
+- safe local demonstrations of compression side-channels
